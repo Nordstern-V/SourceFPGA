@@ -1,0 +1,358 @@
+`timescale 1ns / 1ps
+//////////////////////////////////////////////////////////////////////////////////
+// Company: Meyesemi
+// Engineer: Nill
+// 
+// Create Date: 15/03/23 15:02:21
+// Design Name: 
+// Module Name: rd_buf
+// Project Name: 
+// Target Devices: 
+// Tool Versions: 
+// Description: Modified for PCIe 128-bit Zero Copy
+// 
+// Dependencies: 
+// 
+// Revision:
+// Revision 0.01 - File Created
+// Additional Comments:
+// 
+//////////////////////////////////////////////////////////////////////////////////
+`define UD #1
+module rd_buf #(
+    parameter                     ADDR_WIDTH      = 6'd27,
+    parameter                     ADDR_OFFSET     = 32'h0000_0000,
+    parameter                     H_NUM           = 12'd1920,
+    parameter                     V_NUM           = 12'd1080,
+    parameter                     DQ_WIDTH        = 12'd32,
+    parameter                     LEN_WIDTH       = 12'd16,
+    parameter                     PIX_WIDTH       = 12'd24,
+    parameter                     LINE_ADDR_WIDTH = 16'd19,
+    parameter                     FRAME_CNT_WIDTH = 16'd8
+)  (
+    input                         ddr_clk,
+    input                         ddr_rstn,
+    
+    input                         vout_clk,
+    input                         rd_fsync,
+    input                         rd_en,
+    output                        vout_de,
+    output [127:0]                vout_data, // Changed to 128-bit
+    output                        o_data_ready,
+    
+    input                         init_done,
+    input      [1:0]              i_wr_frame_idx,
+    
+    output                        ddr_rreq,
+    output [ADDR_WIDTH- 1'b1 : 0] ddr_raddr,
+    output [LEN_WIDTH- 1'b1 : 0]  ddr_rd_len,
+    input                         ddr_rrdy,
+    input                         ddr_rdone,
+    
+    input [8*DQ_WIDTH- 1'b1 : 0]  ddr_rdata,
+    input                         ddr_rdata_en 
+);
+    localparam SIM            = 1'b0;
+    localparam RAM_WIDTH      = 128;
+    localparam DDR_DATA_WIDTH = DQ_WIDTH * 8;
+    localparam WR_LINE_NUM    = H_NUM * PIX_WIDTH / RAM_WIDTH;
+    localparam RD_LINE_NUM    = WR_LINE_NUM * RAM_WIDTH / DDR_DATA_WIDTH;
+    // Keep the same address unit conversion as the reference design.
+    localparam DDR_ADDR_OFFSET = RD_LINE_NUM * DDR_DATA_WIDTH / DQ_WIDTH;
+    localparam [9:0] HIGH_WATER = 10'd640;
+    localparam [9:0] LOW_WATER  = 10'd320;
+    localparam [9:0] READY_HI_WATER = 10'd64;
+    localparam [9:0] READY_LO_WATER = 10'd32;
+    localparam [ADDR_WIDTH-1:0] FRAME_ADDR_STRIDE = ({{(ADDR_WIDTH-1){1'b0}},1'b1} << LINE_ADDR_WIDTH);
+    
+    //===========================================================================
+    reg       rd_fsync_1d;
+    reg       rd_en_1d,rd_en_2d;
+    wire      rd_rst;
+    reg       ddr_rstn_1d,ddr_rstn_2d;
+    always @(posedge vout_clk)
+    begin
+        rd_fsync_1d <= rd_fsync;
+        rd_en_1d <= rd_en; 
+        rd_en_2d <= rd_en_1d;
+        ddr_rstn_1d <= ddr_rstn;
+        ddr_rstn_2d <= ddr_rstn_1d;
+    end 
+    assign rd_rst = ~rd_fsync_1d &rd_fsync;
+    
+    //===========================================================================
+    reg      wr_fsync_1d,wr_fsync_2d,wr_fsync_3d;
+    wire     wr_rst;
+    
+    reg  [9:0] wr_addr;
+    reg  [9:0] rd_addr; // Changed to 10-bit for 128-bit width
+    reg  [9:0] rd_addr_ddr_1d, rd_addr_ddr_2d;
+    reg        wr_addr_wrap;
+    reg        rd_addr_wrap;
+    reg        rd_addr_wrap_ddr_1d, rd_addr_wrap_ddr_2d;
+    wire [9:0] fill_level;
+    wire [10:0] fill_level_ext;
+    wire        rd_overtook_wr;
+    reg        prefetch_enable;
+    reg        prefetch_enable_d;
+    reg        req_busy;
+
+    reg      wr_trig;
+    reg      pending_req;
+    reg [11:0] wr_line;
+    reg      ddr_rdone_d;
+    reg      data_ready_ddr;
+    reg      data_ready_sync1;
+    reg      data_ready_sync2;
+    wire     ddr_rdone_rise;
+    wire     prefetch_enable_rise;
+    wire     can_issue_now;
+    wire     can_issue_after_done;
+    wire     set_pending;
+    wire     req_accept;
+
+    // Use wrap-bit pointers to avoid ambiguous modulo subtraction in 1024-depth ring.
+    assign fill_level_ext = {wr_addr_wrap, wr_addr} - {rd_addr_wrap_ddr_2d, rd_addr_ddr_2d};
+    assign rd_overtook_wr = fill_level_ext[10];
+    assign fill_level = rd_overtook_wr ? 10'd0 : fill_level_ext[9:0];
+
+    always @(posedge ddr_clk)
+    begin
+        wr_fsync_1d <= rd_fsync;
+        wr_fsync_2d <= wr_fsync_1d;
+        wr_fsync_3d <= wr_fsync_2d;
+
+        if(~ddr_rstn)
+            wr_trig <= 1'b0;
+        else
+            // ddr_rreq is only generated when the request is accepted by ddr_rrdy.
+            wr_trig <= req_accept;
+    end 
+    
+    always @(posedge ddr_clk)
+    begin
+        if(~ddr_rstn)
+            ddr_rdone_d <= 1'b0;
+        else
+            ddr_rdone_d <= ddr_rdone;
+    end
+    
+    assign ddr_rdone_rise = ddr_rdone & ~ddr_rdone_d;
+
+    assign prefetch_enable_rise = prefetch_enable & ~prefetch_enable_d;
+    assign can_issue_now = init_done && prefetch_enable && (wr_line < V_NUM);
+    assign can_issue_after_done = init_done && prefetch_enable && (wr_line + 12'd1 < V_NUM);
+    assign set_pending = (wr_rst && init_done) ||
+                         (ddr_rdone_rise && can_issue_after_done) ||
+                         (prefetch_enable_rise && can_issue_now && ~req_busy);
+    assign req_accept = pending_req && ddr_rrdy;
+
+    always @(posedge ddr_clk)
+    begin
+        if(~ddr_rstn)
+            pending_req <= 1'b0;
+        else
+        begin
+            case ({set_pending, req_accept})
+                2'b10: pending_req <= 1'b1;
+                2'b01: pending_req <= 1'b0;
+                2'b11: pending_req <= 1'b1;
+                default: pending_req <= pending_req;
+            endcase
+        end
+    end
+
+    always @(posedge ddr_clk)
+    begin
+        if(~ddr_rstn || wr_rst)
+            req_busy <= 1'b0;
+        else if(req_accept)
+            req_busy <= 1'b1;
+        else if(ddr_rdone_rise)
+            req_busy <= 1'b0;
+        else
+            req_busy <= req_busy;
+    end
+
+    always @(posedge ddr_clk)
+    begin
+        if(~ddr_rstn)
+        begin
+            rd_addr_ddr_1d <= 10'd0;
+            rd_addr_ddr_2d <= 10'd0;
+            rd_addr_wrap_ddr_1d <= 1'b0;
+            rd_addr_wrap_ddr_2d <= 1'b0;
+        end
+        else
+        begin
+            rd_addr_ddr_1d <= rd_addr;
+            rd_addr_ddr_2d <= rd_addr_ddr_1d;
+            rd_addr_wrap_ddr_1d <= rd_addr_wrap;
+            rd_addr_wrap_ddr_2d <= rd_addr_wrap_ddr_1d;
+        end
+    end
+
+    always @(posedge ddr_clk)
+    begin
+        if(~ddr_rstn || wr_rst)
+            prefetch_enable <= 1'b1;
+        else if(fill_level >= HIGH_WATER)
+            prefetch_enable <= 1'b0;
+        else if(fill_level <= LOW_WATER)
+            prefetch_enable <= 1'b1;
+        else
+            prefetch_enable <= prefetch_enable;
+    end
+
+    always @(posedge ddr_clk)
+    begin
+        if(~ddr_rstn || wr_rst)
+            prefetch_enable_d <= 1'b1;
+        else
+            prefetch_enable_d <= prefetch_enable;
+    end
+
+    // Export read data readiness with hysteresis to avoid fast oscillation.
+    always @(posedge ddr_clk)
+    begin
+        if(~ddr_rstn || wr_rst)
+            data_ready_ddr <= 1'b0;
+        else if(fill_level >= READY_HI_WATER)
+            data_ready_ddr <= 1'b1;
+        else if(fill_level <= READY_LO_WATER && wr_line < V_NUM)
+            data_ready_ddr <= 1'b0;
+        else if(wr_line >= V_NUM && fill_level == 10'd0)
+            data_ready_ddr <= 1'b0;
+        else
+            data_ready_ddr <= data_ready_ddr;
+    end
+
+    always @(posedge ddr_clk)
+    begin
+        if(wr_rst || (~ddr_rstn))
+            wr_line <= 12'd0;
+        else if(ddr_rdone_rise)
+            wr_line <= wr_line + 12'd1;
+    end 
+    
+    assign wr_rst = ~wr_fsync_3d && wr_fsync_2d;
+    
+    //==========================================================================
+    reg [1:0] locked_frame_idx;
+    wire [ADDR_WIDTH-1:0] locked_frame_base;
+
+    always @(posedge ddr_clk)
+    begin 
+        if(~ddr_rstn)
+            locked_frame_idx <= 2'd0;
+        else if(wr_rst)
+        begin
+            // 3-bank mode: read the previously completed frame bank.
+            case (i_wr_frame_idx)
+                2'd0: locked_frame_idx <= 2'd2;
+                2'd1: locked_frame_idx <= 2'd0;
+                default: locked_frame_idx <= 2'd1;
+            endcase
+        end
+        else
+            locked_frame_idx <= locked_frame_idx;
+    end 
+
+    assign locked_frame_base = (locked_frame_idx == 2'd1) ? FRAME_ADDR_STRIDE :
+                               (locked_frame_idx == 2'd2) ? (FRAME_ADDR_STRIDE << 1) :
+                               {ADDR_WIDTH{1'b0}};
+
+    reg [LINE_ADDR_WIDTH - 1'b1 :0] wr_cnt;
+    always @(posedge ddr_clk)
+    begin 
+        if(wr_rst)
+            wr_cnt <= 10'd0;
+        else if(ddr_rdone_rise)
+            wr_cnt <= wr_cnt + DDR_ADDR_OFFSET;
+        else
+            wr_cnt <= wr_cnt;
+    end 
+    
+    assign ddr_rreq = wr_trig;
+    assign ddr_raddr = locked_frame_base + wr_cnt + ADDR_OFFSET;
+    assign ddr_rd_len = RD_LINE_NUM;
+    
+    wire [127:0]          rd_data; // Changed to 128-bit
+    
+    //===========================================================================
+    always @(posedge ddr_clk)
+    begin
+        if(wr_rst)
+            wr_addr <= (SIM == 1'b1) ? 10'd360 : 10'd0;
+        else if(ddr_rdata_en)
+            wr_addr <= wr_addr + 10'd1;
+        else
+            wr_addr <= wr_addr;
+    end 
+
+    always @(posedge ddr_clk)
+    begin
+        if(wr_rst || (~ddr_rstn))
+            wr_addr_wrap <= 1'b0;
+        else if(ddr_rdata_en && (wr_addr == 10'h3ff))
+            wr_addr_wrap <= ~wr_addr_wrap;
+        else
+            wr_addr_wrap <= wr_addr_wrap;
+    end
+
+    rd_fram_buf rd_fram_buf (
+        .a_wr_data   (  ddr_rdata       ),// input [127:0]            
+        .a_addr      (  wr_addr         ),// input [9:0]              
+        .a_rd_data   (                  ),
+        .a_wr_en     (  ddr_rdata_en    ),// input                    
+        .a_clk       (  ddr_clk         ),// input                    
+        .a_rst       (  ~ddr_rstn       ),// input                    
+        .b_addr      (  rd_addr         ),// input [9:0]             
+        .b_wr_data   (  128'd0          ),
+        .b_rd_data   (  rd_data         ),// output [127:0]            
+        .b_wr_en     (  1'b0            ),
+        .b_clk       (  vout_clk        ),// input                    
+        .b_rst       (  ~ddr_rstn_2d    ) // input                    
+    );
+    
+    // Simple read logic for 128-bit
+    always @(posedge vout_clk)
+    begin
+        if(rd_rst)
+            rd_addr <= 'd0;
+        else if(rd_en)
+            rd_addr <= rd_addr + 1'b1;
+        else
+            rd_addr <= rd_addr;
+    end 
+
+    always @(posedge vout_clk)
+    begin
+        if(rd_rst || (~ddr_rstn_2d))
+            rd_addr_wrap <= 1'b0;
+        else if(rd_en && (rd_addr == 10'h3ff))
+            rd_addr_wrap <= ~rd_addr_wrap;
+        else
+            rd_addr_wrap <= rd_addr_wrap;
+    end
+
+    // Synchronize data-ready level into the read clock domain.
+    always @(posedge vout_clk)
+    begin
+        if(rd_rst || (~ddr_rstn_2d))
+        begin
+            data_ready_sync1 <= 1'b0;
+            data_ready_sync2 <= 1'b0;
+        end
+        else
+        begin
+            data_ready_sync1 <= data_ready_ddr;
+            data_ready_sync2 <= data_ready_sync1;
+        end
+    end
+    
+    assign vout_de = rd_en_2d;
+    assign vout_data = rd_data;
+    assign o_data_ready = data_ready_sync2;
+
+endmodule
